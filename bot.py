@@ -62,24 +62,47 @@ BOLD = "\x02"
 COLORS = ["Red", "Green", "Blue", "Yellow"]
 COLOR_BG = {"Red": "04", "Blue": "12", "Green": "03", "Yellow": "08"}
 COLOR_FG = {"Red": "00", "Blue": "00", "Green": "00", "Yellow": "01"}  # white / black text
-WILD_STYLE = "01,13"
 
 WILD = "Wild"
 WD4 = "Wild Draw Four"
 ACTIONS = ("Skip", "Reverse", "Draw Two")
 
 
+RAINBOW = ["04", "08", "09", "12", "06", "07"]   # red, yellow, green, blue, purple, orange
+_VALUE_LABEL = {"Draw Two": "Draw2"}
+
+
+def rainbow(text, bg=None):
+    """Every letter in its own colour (bg = optional background colour code)."""
+    out = []
+    for i, ch in enumerate(text):
+        fg = RAINBOW[i % len(RAINBOW)]
+        out.append(f"{CC}{fg},{bg}{ch}" if bg else f"{CC}{fg}{ch}")
+    return "".join(out)
+
+
 def fmt(card):
-    """A card as a coloured block."""
+    """A card as a compact coloured block: Blue2, RedDraw2, GreenSkip, Wild, WildDrawFour."""
     color, value = card
     if color == "Wild":
-        label = "WILD Draw Four" if value == WD4 else "WILD"
-        return f"{CC}{WILD_STYLE} {label} {RESET}"
-    return f"{CC}{COLOR_FG[color]},{COLOR_BG[color]} {color} {value} {RESET}"
+        return rainbow("WildDrawFour" if value == WD4 else "Wild", bg="01") + RESET
+    label = _VALUE_LABEL.get(value, value)
+    return f"{CC}{COLOR_FG[color]},{COLOR_BG[color]}{color}{label}{RESET}"
 
 
 def color_block(color):
-    return f"{CC}{COLOR_FG[color]},{COLOR_BG[color]} {color} {RESET}"
+    return f"{CC}{COLOR_FG[color]},{COLOR_BG[color]}{color}{RESET}"
+
+
+_BOT_NAME_RE = re.compile(r"(?<![\w-])" + re.escape(BOT_PLAYER) + r"(?![\w-])", re.IGNORECASE)
+_UNO_RE = re.compile(r"(?<![\w-])UNO(?![\w-])", re.IGNORECASE)
+
+
+def decorate(text):
+    """Applied to everything the bot sends: the computer player's name in red, 'UNO' in rainbow."""
+    text = _BOT_NAME_RE.sub(lambda m: f"{CC}04{m.group(0)}{CC}", text)
+    text = _UNO_RE.sub(lambda m: rainbow(m.group(0)) + CC, text)
+    return text
 
 
 # ============================================================================
@@ -276,7 +299,7 @@ class UnoGame:
         hand = self.hands.get(nick.lower(), [])
         if sort:
             hand.sort(key=card_sort_key)
-        return "  ".join(fmt(c) for c in hand) or "(no cards)"
+        return " ".join(fmt(c) for c in hand) or "(no cards)"
 
     def note_hand(self, nick, sort=False):
         if not self.is_bot(nick):
@@ -834,11 +857,11 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
 
     # ---- flood-safe sending ------------------------------------------------
     def say(self, target, text):
-        for chunk in _split_message(text):
+        for chunk in _split_message(decorate(text), 380):
             self._out_q.append((time.time(), "PRIVMSG", target, chunk))
 
     def notice(self, target, text):
-        for chunk in _split_message(text):
+        for chunk in _split_message(decorate(text), 380):
             self._out_q.append((time.time(), "NOTICE", target, chunk))
 
     def _drain(self):
