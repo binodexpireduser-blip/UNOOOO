@@ -69,7 +69,7 @@ ACTIONS = ("Skip", "Reverse", "Draw Two")
 
 
 PINK = f"{CC}13"                                  # accent colour (numbers, "wins", "jo" ...)
-GREEN = f"{CC}09"                                 # the computer player's name
+BOT_COLOR = f"{CC}63"                             # the computer player's name: neon pink (extended colour 63)
 WILD_BG = "15"                                    # Wild look: purple/blue/pink/green letters on light grey
 WILD_CYCLE = ["06", "02", "13", "03"]
 RAINBOW = ["04", "08", "09", "12", "06", "07"]   # red, yellow, green, blue, purple, orange (the word UNO)
@@ -116,10 +116,22 @@ _BOT_NAME_RE = re.compile(r"(?<![\w-])" + re.escape(BOT_PLAYER) + r"(?![\w-])", 
 _UNO_RE = re.compile(r"(?<![\w-])UNO(?![\w-])", re.IGNORECASE)
 
 
+def _uno_word(m):
+    """UNO in rainbow letters and bold (bold is a toggle, so check if it is already on)."""
+    bold_on = False
+    for ch in m.string[:m.start()]:
+        if ch == BOLD:
+            bold_on = not bold_on
+        elif ch == RESET:
+            bold_on = False
+    word = rainbow(m.group(0)) + CC
+    return word if bold_on else f"{BOLD}{word}{BOLD}"
+
+
 def decorate(text):
-    """Applied to everything the bot sends: the computer player's name in green, 'UNO' in rainbow."""
-    text = _BOT_NAME_RE.sub(lambda m: f"{GREEN}{m.group(0)}{CC}", text)
-    text = _UNO_RE.sub(lambda m: rainbow(m.group(0)) + CC, text)
+    """Applied to everything the bot sends: the computer player's name in neon pink, 'UNO' in bold rainbow."""
+    text = _BOT_NAME_RE.sub(lambda m: f"{BOT_COLOR}{m.group(0)}{CC}", text)
+    text = _UNO_RE.sub(_uno_word, text)
     return text
 
 
