@@ -1,8 +1,11 @@
 """
 storage.py - persistent storage for DrUNO (SQLite, standard library only).
 
-Keeps three things so nothing is lost when the bot disconnects, crashes or restarts:
-  * players      - the leaderboard / stats
+Keeps these things so nothing is lost when the bot disconnects, crashes or restarts:
+  * players      - the leaderboard / stats and the all-time records (updated after EVERY game)
+  * monthly      - the same numbers for the current month only (UTC). Rows of finished
+                   months are deleted automatically; nothing is lost because the all-time
+                   table was already updated at the end of every game.
   * channels     - extra channels the bot was told to join (!callxlr8)
   * saved_games  - a snapshot of every running game, so a game survives a restart
 
@@ -50,20 +53,33 @@ class Storage:
             self._create_tables()
 
     # ------------------------------------------------------------------
+    _PLAYER_COLUMNS = """
+                       nick_lc         TEXT NOT NULL,
+                       display         TEXT NOT NULL,
+                       games           INTEGER NOT NULL DEFAULT 0,
+                       wins            INTEGER NOT NULL DEFAULT 0,
+                       points          INTEGER NOT NULL DEFAULT 0,
+                       cards_played    INTEGER NOT NULL DEFAULT 0,
+                       streak          INTEGER NOT NULL DEFAULT 0,
+                       best_streak     INTEGER NOT NULL DEFAULT 0,
+                       fastest_win     INTEGER,
+                       best_game_points INTEGER NOT NULL DEFAULT 0,
+                       best_game_cards  INTEGER NOT NULL DEFAULT 0,
+                       last_played     REAL"""
+
     def _create_tables(self):
         with self._db:
             self._db.execute(
-                """CREATE TABLE IF NOT EXISTS players (
-                       nick_lc      TEXT PRIMARY KEY,
-                       display      TEXT NOT NULL,
-                       games        INTEGER NOT NULL DEFAULT 0,
-                       wins         INTEGER NOT NULL DEFAULT 0,
-                       points       INTEGER NOT NULL DEFAULT 0,
-                       cards_played INTEGER NOT NULL DEFAULT 0,
-                       streak       INTEGER NOT NULL DEFAULT 0,
-                       best_streak  INTEGER NOT NULL DEFAULT 0,
-                       fastest_win  INTEGER,
-                       last_played  REAL
+                f"""CREATE TABLE IF NOT EXISTS players (
+                       {self._PLAYER_COLUMNS},
+                       PRIMARY KEY (nick_lc)
+                   )"""
+            )
+            self._db.execute(
+                f"""CREATE TABLE IF NOT EXISTS monthly (
+                       month TEXT NOT NULL,
+                       {self._PLAYER_COLUMNS},
+                       PRIMARY KEY (month, nick_lc)
                    )"""
             )
             self._db.execute(
@@ -79,6 +95,24 @@ class Storage:
                        updated    REAL NOT NULL
                    )"""
             )
+        # An older database (from before the records feature) gets the new columns added.
+        have = {r["name"] for r in self._db.execute("PRAGMA table_info(players)")}
+        with self._db:
+            for column in ("best_game_points", "best_game_cards"):
+                if column not in have:
+                    self._db.execute(
+                        f"ALTER TABLE players ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0"
+                    )
+        self._purge_old_months(self.current_month())
+
+    @staticmethod
+    def current_month(now=None):
+        """Month key in UTC, e.g. '2026-10'."""
+        return time.strftime("%Y-%m", time.gmtime(time.time() if now is None else now))
+
+    def _purge_old_months(self, month):
+        with self._lock, self._db:
+            self._db.execute("DELETE FROM monthly WHERE month <> ?", (month,))
 
     def close(self):
         with self._lock:
@@ -90,52 +124,81 @@ class Storage:
     # ------------------------------------------------------------------
     # Leaderboard / stats
     # ------------------------------------------------------------------
+    @staticmethod
+    def _next_stats(row, nick, won, points, duration, played):
+        """New numbers for one player after one game (row = their old row or None)."""
+        old = dict(row) if row is not None else {}
+        new = {
+            "games": old.get("games", 0) + 1,
+            "wins": old.get("wins", 0),
+            "points": old.get("points", 0),
+            "cards_played": old.get("cards_played", 0) + int(played),
+            "streak": old.get("streak", 0),
+            "best_streak": old.get("best_streak", 0),
+            "fastest_win": old.get("fastest_win"),
+            "best_game_points": old.get("best_game_points", 0),
+            "best_game_cards": max(old.get("best_game_cards", 0), int(played)),
+        }
+        if won:
+            new["wins"] += 1
+            new["points"] += int(points)
+            new["streak"] += 1
+            new["best_streak"] = max(new["best_streak"], new["streak"])
+            new["best_game_points"] = max(new["best_game_points"], int(points))
+            secs = int(duration)
+            if new["fastest_win"] is None or secs < new["fastest_win"]:
+                new["fastest_win"] = secs
+        else:
+            new["streak"] = 0
+        return new
+
     def record_game(self, participants, winner, points, duration, plays=None):
-        """Store the result of a finished game.
+        """Store the result of a finished game (all-time AND current month).
 
         participants: nicks that were still in the game at the end (the winner included).
         Anyone who left mid-game is simply not in this list, so the game is erased for them.
-        Returns {nick_lowercase: new_total_points}.
+        Returns {nick_lowercase: new_all_time_total_points}.
         """
         plays = plays or {}
         now = time.time()
+        month = self.current_month(now)
         totals = {}
         winner_lc = winner.lower()
         with self._lock, self._db:
+            self._db.execute("DELETE FROM monthly WHERE month <> ?", (month,))
             for nick in participants:
                 key = nick.lower()
+                won = key == winner_lc
+                played = plays.get(key, 0)
+
                 row = self._db.execute(
                     "SELECT * FROM players WHERE nick_lc = ?", (key,)
                 ).fetchone()
-                if row is None:
-                    games = wins = pts = cards = streak = best = 0
-                    fastest = None
-                else:
-                    games, wins, pts = row["games"], row["wins"], row["points"]
-                    cards, streak, best = row["cards_played"], row["streak"], row["best_streak"]
-                    fastest = row["fastest_win"]
-
-                games += 1
-                cards += int(plays.get(key, 0))
-                if key == winner_lc:
-                    wins += 1
-                    pts += int(points)
-                    streak += 1
-                    best = max(best, streak)
-                    secs = int(duration)
-                    if fastest is None or secs < fastest:
-                        fastest = secs
-                else:
-                    streak = 0
-
+                new = self._next_stats(row, nick, won, points, duration, played)
                 self._db.execute(
                     """INSERT OR REPLACE INTO players
-                       (nick_lc, display, games, wins, points, cards_played,
-                        streak, best_streak, fastest_win, last_played)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (key, nick, games, wins, pts, cards, streak, best, fastest, now),
+                       (nick_lc, display, games, wins, points, cards_played, streak, best_streak,
+                        fastest_win, best_game_points, best_game_cards, last_played)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (key, nick, new["games"], new["wins"], new["points"], new["cards_played"],
+                     new["streak"], new["best_streak"], new["fastest_win"],
+                     new["best_game_points"], new["best_game_cards"], now),
                 )
-                totals[key] = pts
+                totals[key] = new["points"]
+
+                mrow = self._db.execute(
+                    "SELECT * FROM monthly WHERE month = ? AND nick_lc = ?", (month, key)
+                ).fetchone()
+                mnew = self._next_stats(mrow, nick, won, points, duration, played)
+                self._db.execute(
+                    """INSERT OR REPLACE INTO monthly
+                       (month, nick_lc, display, games, wins, points, cards_played, streak,
+                        best_streak, fastest_win, best_game_points, best_game_cards, last_played)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (month, key, nick, mnew["games"], mnew["wins"], mnew["points"],
+                     mnew["cards_played"], mnew["streak"], mnew["best_streak"],
+                     mnew["fastest_win"], mnew["best_game_points"], mnew["best_game_cards"], now),
+                )
         return totals
 
     def _hidden_clause(self):
@@ -201,6 +264,56 @@ class Storage:
         data = dict(row)
         data["win_rate"] = round(100.0 * data["wins"] / data["games"]) if data["games"] else 0
         return data
+
+    # ------------------------------------------------------------------
+    # Records (all-time, or the current month only)
+    # ------------------------------------------------------------------
+    def _best(self, table, month, column, smallest=False):
+        clause, params = self._hidden_clause()
+        where, args = [clause], list(params)
+        if month:
+            where.append("month = ?")
+            args.append(month)
+        if smallest:
+            where.append(f"{column} IS NOT NULL")
+            order = f"{column} ASC"
+        else:
+            where.append(f"{column} > 0")
+            order = f"{column} DESC"
+        row = self._db.execute(
+            f"SELECT display, {column} AS v FROM {table} WHERE {' AND '.join(where)} "
+            f"ORDER BY {order}, nick_lc ASC LIMIT 1",
+            args,
+        ).fetchone()
+        return (row["display"], row["v"]) if row else None
+
+    def records(self, monthly=False, min_games=10):
+        """The record holders. Hidden nicks (the computer player) never hold a record.
+
+        high_score: most points in one game | fastest: quickest win (seconds)
+        cards: most cards played by one player in one game | streak: best win streak
+        winrate: best win percentage among players with at least min_games games
+        """
+        table = "monthly" if monthly else "players"
+        month = self.current_month() if monthly else None
+        with self._lock:
+            clause, params = self._hidden_clause()
+            where, args = [clause, "games >= ?"], list(params) + [int(min_games)]
+            if month:
+                where.append("month = ?")
+                args.append(month)
+            rate = self._db.execute(
+                f"SELECT display, wins * 100.0 / games AS v FROM {table} "
+                f"WHERE {' AND '.join(where)} ORDER BY v DESC, games DESC, nick_lc ASC LIMIT 1",
+                args,
+            ).fetchone()
+            return {
+                "high_score": self._best(table, month, "best_game_points"),
+                "fastest": self._best(table, month, "fastest_win", smallest=True),
+                "cards": self._best(table, month, "best_game_cards"),
+                "streak": self._best(table, month, "best_streak"),
+                "winrate": (rate["display"], rate["v"]) if rate else None,
+            }
 
     # ------------------------------------------------------------------
     # Extra channels (added with !callxlr8, removed with !leavexlr8)
