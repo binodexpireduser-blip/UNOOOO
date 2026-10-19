@@ -68,7 +68,8 @@ WD4 = "Wild Draw Four"
 ACTIONS = ("Skip", "Reverse", "Draw Two")
 
 
-PINK = f"{CC}13"                                  # accent colour (computer player, numbers)
+PINK = f"{CC}13"                                  # accent colour (numbers, "wins", "jo" ...)
+GREEN = f"{CC}09"                                 # the computer player's name
 WILD_BG = "15"                                    # Wild look: purple/blue/pink/green letters on light grey
 WILD_CYCLE = ["06", "02", "13", "03"]
 RAINBOW = ["04", "08", "09", "12", "06", "07"]   # red, yellow, green, blue, purple, orange (the word UNO)
@@ -116,8 +117,8 @@ _UNO_RE = re.compile(r"(?<![\w-])UNO(?![\w-])", re.IGNORECASE)
 
 
 def decorate(text):
-    """Applied to everything the bot sends: the computer player's name in pink, 'UNO' in rainbow."""
-    text = _BOT_NAME_RE.sub(lambda m: f"{PINK}{m.group(0)}{CC}", text)
+    """Applied to everything the bot sends: the computer player's name in green, 'UNO' in rainbow."""
+    text = _BOT_NAME_RE.sub(lambda m: f"{GREEN}{m.group(0)}{CC}", text)
     text = _UNO_RE.sub(lambda m: rainbow(m.group(0)) + CC, text)
     return text
 
@@ -607,8 +608,8 @@ class UnoGame:
     def _end(self, winner, points, cards_taken):
         self.state = self.OVER
         duration = time.time() - (self.started_at or time.time())
-        self.say(f"🏆 {BOLD}{winner}{RESET} wins {PINK}{points}{CC} Points by taking {PINK}{cards_taken}{CC} Cards.")
-        self.say(f"Cards played: {self.cards_played} Cards in {fmt_duration(duration)}")
+        self.say(f"🏆 {BOLD}{winner}{RESET} {PINK}wins {points}{CC} Points by taking {PINK}{cards_taken}{CC} Cards.")
+        self.say(f"Cards played: {PINK}{self.cards_played}{CC} Cards in {PINK}{fmt_duration(duration)}{CC}")
         self.out.result = {
             "winner": winner,
             "points": points,
@@ -1126,8 +1127,8 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
         self.games[ch] = game
         self.say(
             channel,
-            f"{BOLD}UNO!{RESET} initiated by {nick}. You have {LOBBY_SECONDS}s to join! "
-            f"Type 'jo' to jump in. (max {MAX_PLAYERS} players)",
+            f"{BOLD}UNO!{RESET} initiated by {nick}. You have {PINK}{LOBBY_SECONDS}s{CC} to join! "
+            f"Type '{PINK}jo{CC}' to jump in. (max {MAX_PLAYERS} players)",
         )
         self._later(LOBBY_SECONDS, self._lobby_timeout, ch, game)
 
@@ -1214,7 +1215,7 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
         )
         total = totals.get(result["winner"].lower())
         if total is not None:
-            self.say(game.channel, f"{BOLD}{result['winner']}{RESET} total: {total} Points")
+            self.say(game.channel, f"{BOLD}{result['winner']}{RESET} total: {PINK}{total}{CC} Points")
 
     # ---- timers: computer moves and turn timeouts -------------------------------
     def _arm(self, game):
