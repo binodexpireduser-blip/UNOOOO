@@ -68,7 +68,10 @@ WD4 = "Wild Draw Four"
 ACTIONS = ("Skip", "Reverse", "Draw Two")
 
 
-RAINBOW = ["04", "08", "09", "12", "06", "07"]   # red, yellow, green, blue, purple, orange
+PINK = f"{CC}13"                                  # accent colour (computer player, numbers)
+WILD_BG = "15"                                    # Wild look: purple/blue/pink/green letters on light grey
+WILD_CYCLE = ["06", "02", "13", "03"]
+RAINBOW = ["04", "08", "09", "12", "06", "07"]   # red, yellow, green, blue, purple, orange (the word UNO)
 _VALUE_LABEL = {"Draw Two": "Draw2"}
 
 
@@ -81,17 +84,31 @@ def rainbow(text, bg=None):
     return "".join(out)
 
 
+def wild_block(label):
+    """Wild / WildDrawFour exactly like the reference picture."""
+    parts = []
+    for i, ch in enumerate(label):
+        fg = WILD_CYCLE[i % len(WILD_CYCLE)]
+        pad = " " if i == 0 else ""
+        parts.append(f"{CC}{fg},{WILD_BG}{pad}{ch}")
+    return "".join(parts) + " " + RESET
+
+
 def fmt(card):
     """A card as a compact coloured block: Blue2, RedDraw2, GreenSkip, Wild, WildDrawFour."""
     color, value = card
     if color == "Wild":
-        return rainbow("WildDrawFour" if value == WD4 else "Wild", bg="01") + RESET
+        return wild_block("WildDrawFour" if value == WD4 else "Wild")
     label = _VALUE_LABEL.get(value, value)
-    return f"{CC}{COLOR_FG[color]},{COLOR_BG[color]}{color}{label}{RESET}"
+    return f"{CC}{COLOR_FG[color]},{COLOR_BG[color]} {color}{label} {RESET}"
 
 
 def color_block(color):
-    return f"{CC}{COLOR_FG[color]},{COLOR_BG[color]}{color}{RESET}"
+    return f"{CC}{COLOR_FG[color]},{COLOR_BG[color]} {color} {RESET}"
+
+
+def b(nick):
+    return f"{BOLD}{nick}{RESET}"
 
 
 _BOT_NAME_RE = re.compile(r"(?<![\w-])" + re.escape(BOT_PLAYER) + r"(?![\w-])", re.IGNORECASE)
@@ -99,8 +116,8 @@ _UNO_RE = re.compile(r"(?<![\w-])UNO(?![\w-])", re.IGNORECASE)
 
 
 def decorate(text):
-    """Applied to everything the bot sends: the computer player's name in red, 'UNO' in rainbow."""
-    text = _BOT_NAME_RE.sub(lambda m: f"{CC}04{m.group(0)}{CC}", text)
+    """Applied to everything the bot sends: the computer player's name in pink, 'UNO' in rainbow."""
+    text = _BOT_NAME_RE.sub(lambda m: f"{PINK}{m.group(0)}{CC}", text)
     text = _UNO_RE.sub(lambda m: rainbow(m.group(0)) + CC, text)
     return text
 
@@ -148,11 +165,11 @@ _COLOR_LETTERS = {"r": "Red", "g": "Green", "b": "Blue", "y": "Yellow"}
 _ACTION_ALIASES = {
     "s": "Skip", "skip": "Skip",
     "r": "Reverse", "rev": "Reverse", "reverse": "Reverse",
-    "d2": "Draw Two", "dt": "Draw Two", "+2": "Draw Two",
+    "d": "Draw Two", "d2": "Draw Two", "dt": "Draw Two", "+2": "Draw Two",
     "draw2": "Draw Two", "drawtwo": "Draw Two",
 }
-_WILD_ALIASES = {"w", "wd", "wild"}
-_WD4_ALIASES = {"wd4", "d4", "+4", "w4", "wild4", "wilddraw4", "wilddrawfour"}
+_WILD_ALIASES = {"w", "wild"}
+_WD4_ALIASES = {"wd", "wd4", "d4", "+4", "w4", "wild4", "wilddraw4", "wilddrawfour"}
 
 
 def parse_card(text):
@@ -293,7 +310,8 @@ class UnoGame:
     def announce_turn(self):
         cur = self.current()
         if cur and not self.is_bot(cur):
-            self.say(f"It is now {BOLD}{cur}'s{RESET} turn. Top card: {self.top_str()}")
+            self.say(f"It is now {BOLD}{cur}'s{RESET} turn.")
+            self.note_hand(cur)
 
     def hand_text(self, nick, sort=False):
         hand = self.hands.get(nick.lower(), [])
@@ -315,6 +333,10 @@ class UnoGame:
             random.shuffle(self.draw_pile)
             self.say("Reshuffling the discard pile...")
         return self.draw_pile.pop() if self.draw_pile else None
+
+    def _note_drew(self, nick, cards):
+        if cards and not self.is_bot(nick):
+            self.note(nick, "You drew: " + " ".join(fmt(c) for c in cards))
 
     def _give(self, nick, count):
         cards = []
@@ -375,9 +397,6 @@ class UnoGame:
 
         self.say(f"{BOLD}Welcome to UNO!{RESET}")
         self.say(f"{len(self.players)} players this round: {' '.join(self.players)}")
-        for p in self.humans():
-            self.note_hand(p)
-        self.say(f"The first card is {fmt(starter)}")
 
         first = self.players[0]
         if self.value == "Skip":
@@ -393,10 +412,11 @@ class UnoGame:
         elif self.value == "Draw Two":
             drew = self._give(first, 2)
             self.say(f"{first} draws {len(drew)} cards and is skipped!")
-            self.note_hand(first)
             self.turn_idx = self._next_idx(1)
         self._bump()
-        self.say(f"{self.current()} plays first... Top card: {self.top_str()}")
+        self.say(f"{b(self.current())} plays first... The top card is {self.top_str()}")
+        for p in self.humans():
+            self.note_hand(p)
 
     # ---- player actions ----------------------------------------------------
     def play(self, nick, text, explicit=True):
@@ -407,8 +427,15 @@ class UnoGame:
             return
         if self.state != self.PLAYING or not self.is_current(nick):
             return
-        card = parse_card(text)
         hand = self.hands[nick.lower()]
+        if re.sub(r"\s+", "", (text or "").lower()) == "wd":
+            plain, four = ("Wild", WILD), ("Wild", WD4)
+            if plain in hand and four in hand:
+                self.note(nick, "You hold both Wilds: type 'w' for Wild or 'wd4' for Wild Draw Four.")
+                return
+            card = plain if plain in hand else four
+        else:
+            card = parse_card(text)
         if card is None or card not in hand:
             if explicit:
                 self.note(nick, "❌ You don't have that card, type 'dr' to draw or play another.")
@@ -418,8 +445,6 @@ class UnoGame:
                 self.note(nick, "❌ Invalid play! Must match current pile color or value.")
             return
         self._do_play(nick, card)
-        if self.state in (self.PLAYING, self.AWAIT_COLOR):
-            self.note_hand(nick)
 
     def _do_play(self, nick, card):
         low = nick.lower()
@@ -438,10 +463,10 @@ class UnoGame:
             if value == WD4:
                 victim = self.players[self._next_idx(1)]
                 drew = self._give(victim, 4)
-                self.say(f"{nick} plays {fmt(card)} 🔥 {victim} draws {len(drew)} cards and is skipped...")
-                self.note_hand(victim)
+                self.say(f"{b(nick)} plays {fmt(card)} 🔥 {b(victim)} draws {len(drew)} cards and is skipped...")
+                self._note_drew(victim, drew)
             else:
-                self.say(f"{nick} plays {fmt(card)}")
+                self.say(f"{b(nick)} plays {fmt(card)}")
             if not hand:
                 return self._win(nick)
             self._uno_check(nick)
@@ -449,25 +474,25 @@ class UnoGame:
             if self.is_bot(nick):
                 self._bot_choose_color(nick)
             else:
-                self.say(f"{nick}, choose a color: co r / co g / co b / co y")
+                self.say(f"{b(nick)}, choose a color: co r / co g / co b / co y")
             return
 
         self.color = color
         two = len(self.players) == 2
         nxt = self.players[self._next_idx(1)]
         if value == "Skip":
-            self.say(f"{nick} plays {fmt(card)}, {nxt} is skipped")
+            self.say(f"{b(nick)} plays {fmt(card)}, {nxt} is skipped")
         elif value == "Reverse":
             if two:
-                self.say(f"{nick} plays {fmt(card)}, {nxt} is skipped")
+                self.say(f"{b(nick)} plays {fmt(card)}, {nxt} is skipped")
             else:
-                self.say(f"{nick} plays {fmt(card)}, direction reversed")
+                self.say(f"{b(nick)} plays {fmt(card)}, direction reversed")
         elif value == "Draw Two":
             drew = self._give(nxt, 2)
-            self.say(f"{nick} plays {fmt(card)} {nxt} draws {len(drew)} cards and is skipped")
-            self.note_hand(nxt)
+            self.say(f"{b(nick)} plays {fmt(card)} {b(nxt)} draws {len(drew)} cards and is skipped")
+            self._note_drew(nxt, drew)
         else:
-            self.say(f"{nick} plays {fmt(card)} to {nxt}")
+            self.say(f"{b(nick)} plays {fmt(card)} to {b(nxt)}")
 
         if not hand:
             return self._win(nick)
@@ -502,7 +527,7 @@ class UnoGame:
     def _apply_color(self, nick, color):
         self.color = color
         self.state = self.PLAYING
-        self.say(f"🎨 {nick} chose {color_block(color)} Play continues!")
+        self.say(f"🎨 {b(nick)} chose {color_block(color)} Play continues!")
         self.advance(2 if self.value == WD4 else 1)
         self.announce_turn()
 
@@ -523,8 +548,7 @@ class UnoGame:
         self.has_drawn = True
         self._bump()
         self.note(nick, f"You drew: {fmt(card)}")
-        self.say(f"{nick} drew a card. They can play a card or type 'pa' to pass.")
-        self.note_hand(nick)
+        self.say(f"{b(nick)} drew a card. They can play a card or type 'pa' to pass.")
 
     def pass_turn(self, nick):
         if self.state != self.PLAYING or not self.is_current(nick):
@@ -533,7 +557,7 @@ class UnoGame:
             self.note(nick, "❌ You must draw a card ('dr') before you can pass your turn.")
             return
         self.strikes[nick.lower()] = 0
-        self.say(f"⏩ {nick} passes their turn.")
+        self.say(f"⏩ {b(nick)} passes their turn.")
         self.advance(1)
         self.announce_turn()
 
@@ -590,7 +614,7 @@ class UnoGame:
     def _end(self, winner, points, cards_taken):
         self.state = self.OVER
         duration = time.time() - (self.started_at or time.time())
-        self.say(f"🏆 {BOLD}{winner}{RESET} wins {points} Points by taking {cards_taken} Cards.")
+        self.say(f"🏆 {BOLD}{winner}{RESET} wins {PINK}{points}{CC} Points by taking {PINK}{cards_taken}{CC} Cards.")
         self.say(f"Cards played: {self.cards_played} Cards in {fmt_duration(duration)}")
         self.out.result = {
             "winner": winner,
@@ -700,7 +724,6 @@ class UnoGame:
                 self.note(nick, f"You drew: {fmt(card)}")
         self.say(f"⏰ {nick} took too long: auto-draw and pass. (strike 1/2)")
         self.advance(1)
-        self.note_hand(nick)
         self.announce_turn()
 
     def rename(self, old, new):
@@ -951,6 +974,7 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
         game = self.games.get(ch)
         if game and game.state in (UnoGame.PLAYING, UnoGame.AWAIT_COLOR):
             self.say(channel, f"{BOLD}DrUNO is back!{RESET} The game continues.")
+            game.info_top()
             game.announce_turn()
             if game.is_bot(game.current() or ""):
                 game.say(f"It is {game.current()}'s turn.")
@@ -1086,7 +1110,7 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
             return
         if gcmd == "pl":
             if not args:
-                return self.notice(nick, "Usage: pl <card>   e.g. pl r5, pl bs, pl gd2, pl wd, pl wd4")
+                return self.notice(nick, "Usage: pl <card>   e.g. pl r5, pl bs, pl gd, pl w, pl wd")
             return self._run(game, game.play, nick, " ".join(args), True)
         if gcmd in ("co", "choose"):
             if args:
@@ -1123,7 +1147,7 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
 
     def _cmd_rules(self, nick):
         lines = [
-            "UNO rules: everyone starts with 7 cards. Match the top card by color or value with 'pl <card>' (or just type the card, e.g. r5, bs, gd2, wd, wd4).",
+            "UNO rules: everyone starts with 7 cards. Match the top card by color or value with 'pl <card>' (or just type the card, e.g. r5, bs, gd = Green Draw Two, w = Wild, wd = Wild Draw Four).",
             "No match? 'dr' draws one card, then play it or 'pa' to pass. After a Wild, choose the color with 'co r/g/b/y'.",
             "Skip skips the next player, Reverse flips direction (acts as Skip with 2 players), Draw Two/Wild Draw Four make the next player draw and lose their turn.",
             "First to empty their hand scores the cards left in everyone else's hands. Other commands: od cd tu ct st ca !remove !utop !urank !ustats",
@@ -1135,7 +1159,7 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
         rows = self.store.top(10)
         if not rows:
             return self.say(channel, "No UNO games have been played yet.")
-        line = " | ".join(f"{i}. {r['display']} {r['points']}" for i, r in enumerate(rows, 1))
+        line = " | ".join(f"{i}. {r['display']} {PINK}{r['points']}{CC}" for i, r in enumerate(rows, 1))
         self.say(channel, f"{BOLD}UNO Top 10{RESET} (points): {line}")
 
     def _cmd_rank(self, channel, target):
@@ -1148,7 +1172,7 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
         self.say(
             channel,
             f"{BOLD}{info['display']}{RESET} is ranked #{info['rank']} of {info['total']} "
-            f"with {info['points']} points ({info['wins']} wins in {info['games']} games)",
+            f"with {PINK}{info['points']}{CC} points ({info['wins']} wins in {info['games']} games)",
         )
 
     def _cmd_stats(self, channel, target):
@@ -1160,7 +1184,7 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
         self.say(
             channel,
             f"{BOLD}{s['display']}{RESET}: Games {s['games']} | Wins {s['wins']} ({s['win_rate']}%) | "
-            f"Points {s['points']} | Streak {s['streak']} (best {s['best_streak']}) | "
+            f"Points {PINK}{s['points']}{CC} | Streak {s['streak']} (best {s['best_streak']}) | "
             f"Fastest win {fastest} | Cards played {s['cards_played']}",
         )
 
