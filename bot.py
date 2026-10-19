@@ -50,6 +50,8 @@ TURN_TIMEOUT = _env_int("UNO_TURN_TIMEOUT", 45)       # seconds a human may thin
 BOT_THINK_SECONDS = _env_float("UNO_BOT_THINK", 2.0)  # pause before the computer plays
 RESUME_MAX_AGE = _env_int("UNO_RESUME_MAX_AGE", 900)  # drop saved games older than this
 SEND_INTERVAL = _env_float("IRC_SEND_INTERVAL", 0.6)  # seconds per outgoing line (flood safety)
+MIN_GAMES_ALL = _env_int("UNO_MIN_GAMES_ALL", 10)      # games needed to be listed for Best Win% (all-time)
+MIN_GAMES_MONTH = _env_int("UNO_MIN_GAMES_MONTH", 5)   # same, for the monthly record
 SEND_BURST = 4                                        # lines that may go out back-to-back
 
 # ============================================================================
@@ -112,19 +114,38 @@ def b(nick):
     return f"{BOLD}{nick}{RESET}"
 
 
-_BOT_NAME_RE = re.compile(r"(?<![\w-])" + re.escape(BOT_PLAYER) + r"(?![\w-])", re.IGNORECASE)
-_UNO_RE = re.compile(r"(?<![\w-])UNO(?![\w-])", re.IGNORECASE)
+def bold_line(text):
+    """Whole line in bold: every card block ends with a reset, so switch bold back on after each."""
+    return BOLD + text.replace(RESET, RESET + BOLD)
+
+
+# A word starts after a non-word character, or right after a colour code like \x0313 or \x0313,15
+_WORD_START = r"(?:(?<![\w-])|(?<=\x03\d\d)|(?<=\x03\d\d,\d\d))"
+_BOT_NAME_RE = re.compile(_WORD_START + re.escape(BOT_PLAYER) + r"(?![\w-])", re.IGNORECASE)
+_UNO_RE = re.compile(_WORD_START + r"UNO(?![\w-])", re.IGNORECASE)
+
+
+_CTRL_RE = re.compile(r"\x03(\d{1,2})?(?:,(\d{1,2}))?|\x02|\x0f")
 
 
 def _uno_word(m):
-    """UNO in rainbow letters and bold (bold is a toggle, so check if it is already on)."""
-    bold_on = False
-    for ch in m.string[:m.start()]:
-        if ch == BOLD:
+    """UNO in rainbow letters and bold. Bold is a toggle and the rainbow resets the colour,
+    so look at what is already active in front of the word and restore it afterwards."""
+    bold_on, fg, bg = False, None, None
+    for t in _CTRL_RE.finditer(m.string[:m.start()]):
+        tok = t.group(0)
+        if tok == BOLD:
             bold_on = not bold_on
-        elif ch == RESET:
-            bold_on = False
-    word = rainbow(m.group(0)) + CC
+        elif tok == RESET:
+            bold_on, fg, bg = False, None, None
+        elif t.group(1) is None:
+            fg, bg = None, None
+        else:
+            fg = t.group(1)
+            if t.group(2) is not None:
+                bg = t.group(2)
+    word = rainbow(m.group(0))
+    word += (f"{CC}{fg}" + (f",{bg}" if bg else "")) if fg else CC
     return word if bold_on else f"{BOLD}{word}{BOLD}"
 
 
@@ -153,11 +174,14 @@ def build_deck():
 
 
 def card_points(card):
+    """Wild + Wild Draw Four 100, Draw Two 50, Skip + Reverse 20, numbers face value."""
     color, value = card
     if color == "Wild":
-        return 50
+        return 100
     if value.isdigit():
         return int(value)
+    if value == "Draw Two":
+        return 50
     return 20
 
 
@@ -171,6 +195,17 @@ def card_sort_key(card):
     else:
         v = 20 + (1 if value == WD4 else 0)
     return (order, v)
+
+
+def group_cards(hand):
+    """Cards grouped by colour: Red, Green, Blue, Yellow, then the Wilds."""
+    ordered = sorted(hand, key=card_sort_key)
+    groups = []
+    for color in COLORS + ["Wild"]:
+        cards = [c for c in ordered if c[0] == color]
+        if cards:
+            groups.append(" ".join(fmt(c) for c in cards))
+    return "  ".join(groups) or "(no cards)"
 
 
 _COLOR_WORDS = {"red": "r", "green": "g", "blue": "b", "yellow": "y"}
@@ -222,6 +257,22 @@ def parse_color(text):
 
 def is_playable(card, color, value):
     return card[0] == "Wild" or card[0] == color or card[1] == value
+
+
+def fmt_short(seconds):
+    """14 -> '14s', 117 -> '1m:57s' (used in the records)."""
+    seconds = int(seconds)
+    return f"{seconds}s" if seconds < 60 else f"{seconds // 60}m:{seconds % 60:02d}s"
+
+
+def pk(value):
+    """A value in the pink accent colour."""
+    return f"{PINK}{value}{CC}"
+
+
+def heading(text):
+    """Bold pink heading (used by the records)."""
+    return f"{BOLD}{PINK}{text}{CC}{BOLD}"
 
 
 def fmt_duration(seconds):
@@ -328,14 +379,12 @@ class UnoGame:
 
     def hand_text(self, nick, sort=False):
         hand = self.hands.get(nick.lower(), [])
-        if sort:
-            hand.sort(key=card_sort_key)
-        return " ".join(fmt(c) for c in hand) or "(no cards)"
+        hand.sort(key=card_sort_key)
+        return group_cards(hand)
 
     def note_hand(self, nick, sort=False):
         if not self.is_bot(nick):
-            label = "Sorted Hand" if sort else "Your Hand"
-            self.note(nick, f"{label}: {self.hand_text(nick, sort)}")
+            self.note(nick, f"Your Hand: {self.hand_text(nick)}")
 
     # ---- deck --------------------------------------------------------------
     def _draw_one(self):
@@ -427,7 +476,7 @@ class UnoGame:
             self.say(f"{first} draws {len(drew)} cards and is skipped!")
             self.turn_idx = self._next_idx(1)
         self._bump()
-        self.say(f"{b(self.current())} plays first... The top card is {self.top_str()}")
+        self.say(f"{b(self.current())} plays first... Current pile top card: {self.top_str()}")
         for p in self.humans():
             self.note_hand(p)
 
@@ -466,15 +515,17 @@ class UnoGame:
         self._bump()
 
         if color == "Wild":
+            victim, drew = None, []
             if value == WD4:
                 victim = self.players[self._next_idx(1)]
-                drew = self._give(victim, 4)
+                drew = self._give(victim, 4)              # drawn before scoring, even on a winning play
+            if not hand:
+                return self._win(nick, card)
+            if victim:
                 self.say(f"{b(nick)} plays {fmt(card)} 🔥 {b(victim)} draws {len(drew)} cards and is skipped...")
                 self._note_drew(victim, drew)
             else:
                 self.say(f"{b(nick)} plays {fmt(card)}")
-            if not hand:
-                return self._win(nick)
             self._uno_check(nick)
             self.state = self.AWAIT_COLOR
             if self.is_bot(nick):
@@ -486,6 +537,10 @@ class UnoGame:
         self.color = color
         two = len(self.players) == 2
         nxt = self.players[self._next_idx(1)]
+        drew = self._give(nxt, 2) if value == "Draw Two" else []
+        if not hand:
+            return self._win(nick, card)
+
         if value == "Skip":
             self.say(f"{b(nick)} plays {fmt(card)}, {nxt} is skipped")
         elif value == "Reverse":
@@ -494,14 +549,10 @@ class UnoGame:
             else:
                 self.say(f"{b(nick)} plays {fmt(card)}, direction reversed")
         elif value == "Draw Two":
-            drew = self._give(nxt, 2)
             self.say(f"{b(nick)} plays {fmt(card)} {b(nxt)} draws {len(drew)} cards and is skipped")
             self._note_drew(nxt, drew)
         else:
             self.say(f"{b(nick)} plays {fmt(card)} to {b(nxt)}")
-
-        if not hand:
-            return self._win(nick)
         self._uno_check(nick)
 
         if value in ("Skip", "Draw Two"):
@@ -617,14 +668,20 @@ class UnoGame:
         self._apply_color(nick, color)
 
     # ---- ending ------------------------------------------------------------
-    def _end(self, winner, points, cards_taken):
+    def _end(self, winner, leftovers, play_line=None):
+        """leftovers = [(nick, [cards])] of everyone who did not win; they decide the points."""
         self.state = self.OVER
         duration = time.time() - (self.started_at or time.time())
-        self.say(f"🏆 {BOLD}{winner}{RESET} {PINK}wins {points}{CC} Points by taking {PINK}{cards_taken}{CC} Cards.")
-        self.say(f"Cards played: {PINK}{self.cards_played}{CC} Cards in {PINK}{fmt_duration(duration)}{CC}")
+        points = sum(card_points(c) for _, hand in leftovers for c in hand)
+        cards_taken = sum(len(hand) for _, hand in leftovers)
+        if play_line:
+            self.say(bold_line(play_line))
+        for nick, hand in leftovers:
+            self.say(bold_line(f"UNO - {nick}🃏 {group_cards(hand)}"))
         self.out.result = {
             "winner": winner,
             "points": points,
+            "cards_taken": cards_taken,
             "participants": list(self.players),
             "duration": duration,
             "cards_played": self.cards_played,
@@ -632,10 +689,10 @@ class UnoGame:
         }
         self._bump()
 
-    def _win(self, nick):
+    def _win(self, nick, card):
         low = nick.lower()
-        leftovers = [c for p in self.players if p.lower() != low for c in self.hands[p.lower()]]
-        self._end(nick, sum(card_points(c) for c in leftovers), len(leftovers))
+        leftovers = [(p, self.hands[p.lower()]) for p in self.players if p.lower() != low]
+        self._end(nick, leftovers, f"{nick} plays {fmt(card)} and Wins UNO 🎉")
 
     # ---- leaving -----------------------------------------------------------
     def remove(self, nick, reason="left the game"):
@@ -668,7 +725,7 @@ class UnoGame:
             if bot_in:                                   # forfeit: the computer wins
                 self.players.pop(idx)
                 self.say(f"{leaver} {reason}.")
-                self._end(self.bot_name, sum(card_points(c) for c in hand), len(hand))
+                self._end(self.bot_name, [(leaver, hand)])
             else:
                 self.players.pop(idx)
                 self.state = self.OVER
@@ -757,7 +814,7 @@ class UnoGame:
 
     def info_top(self):
         if self.state in (self.PLAYING, self.AWAIT_COLOR):
-            self.say(f"Current pile top card: {self.top_str()}")
+            self.say(f"UNO Card in play: {self.top_str()}")
 
     def info_turn(self):
         cur = self.current()
@@ -1078,6 +1135,10 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
             return self._cmd_rank(channel, args[0] if args else nick)
         if cmd == "!ustats":
             return self._cmd_stats(channel, args[0] if args else nick)
+        if cmd in ("!unoallrec", "!unorec"):
+            return self._cmd_records(channel, monthly=False)
+        if cmd == "!unomonrec":
+            return self._cmd_records(channel, monthly=True)
 
         # ---- starting / joining ----
         if cmd == "!uno" and len(parts) == 1:
@@ -1086,8 +1147,8 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
             if game and game.state == UnoGame.LOBBY:
                 self._run(game, game.join, nick)
             return
-        if cmd == "!gamerules":
-            return self._cmd_rules(nick)
+        if cmd == "!faquno":
+            return self._cmd_faq(nick)
         if cmd == "!remove" and len(parts) == 1:
             if game and game.has_player(nick):
                 self._run(game, game.remove, nick, "left the game")
@@ -1151,12 +1212,17 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
             return self._later(5, self._lobby_timeout, ch, game)
         self._run(game, game.finish_lobby)
 
-    def _cmd_rules(self, nick):
+    def _cmd_faq(self, nick):
         lines = [
-            "UNO rules: everyone starts with 7 cards. Match the top card by color or value with 'pl <card>' (or just type the card, e.g. r5, bs, gd = Green Draw Two, w = Wild, wd = Wild Draw Four).",
-            "No match? 'dr' draws one card, then play it or 'pa' to pass. After a Wild, choose the color with 'co r/g/b/y'.",
-            "Skip skips the next player, Reverse flips direction (acts as Skip with 2 players), Draw Two/Wild Draw Four make the next player draw and lose their turn.",
-            "First to empty their hand scores the cards left in everyone else's hands. Other commands: od cd tu ct st ca !remove !utop !urank !ustats",
+            f"{BOLD}UNO commands{RESET}",
+            f"Game: {pk('!uno')} start | {pk('jo')} join | {pk('!remove')} leave",
+            f"Play: {pk('pl <card>')} or just the card ({pk('r5')} {pk('bs')} {pk('gd')} {pk('w')} {pk('wd4')}) | "
+            f"{pk('dr')} draw | {pk('pa')} pass | {pk('co r/g/b/y')} pick a color",
+            f"Info: {pk('ca')} your hand | {pk('cd')} card in play | {pk('tu')} turn | {pk('od')} order | "
+            f"{pk('ct')} card counts | {pk('st')} match stats",
+            f"Stats: {pk('!utop')} | {pk('!urank <nick>')} | {pk('!ustats <nick>')} | "
+            f"{pk('!unoallrec')} all-time records | {pk('!unomonrec')} this month",
+            f"Points: Wild / Wild Draw Four {pk(100)} | Draw Two {pk(50)} | Skip / Reverse {pk(20)} | numbers face value",
         ]
         for line in lines:
             self.notice(nick, line)
@@ -1189,9 +1255,37 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
         fastest = fmt_duration(s["fastest_win"]) if s["fastest_win"] is not None else "-"
         self.say(
             channel,
-            f"{BOLD}{s['display']}{RESET}: Games {s['games']} | Wins {s['wins']} ({s['win_rate']}%) | "
-            f"Points {PINK}{s['points']}{CC} | Streak {s['streak']} (best {s['best_streak']}) | "
-            f"Fastest win {fastest} | Cards played {s['cards_played']}",
+            f"{BOLD}{s['display']}{RESET}: Games {pk(s['games'])} | Wins {pk(s['wins'])} ({pk(str(s['win_rate']) + '%')}) | "
+            f"Points {pk(s['points'])} | Best Streak: {pk(s['best_streak'])} | Current Streak: {pk(s['streak'])} | "
+            f"Fastest win {pk(fastest)} | Cards played {pk(s['cards_played'])}",
+        )
+
+    def _cmd_records(self, channel, monthly):
+        rec = self.store.records(monthly=monthly, min_games=MIN_GAMES_MONTH if monthly else MIN_GAMES_ALL)
+        if monthly:
+            label = time.strftime("%B %Y", time.gmtime(time.time()))
+            title = f"{heading('UNO Monthly Records')} {pk('(' + label + ' UTC)')}"
+        else:
+            title = heading("UNO All-Time Records")
+        self.say(channel, title)
+        if not any(rec.values()):
+            return self.say(channel, "No games recorded yet." if not monthly else "No games recorded this month yet.")
+
+        def item(label, value):
+            return f"{heading(label)} {pk(value)}"
+
+        none = "-"
+        hs, fast, cards = rec["high_score"], rec["fastest"], rec["cards"]
+        streak, rate = rec["streak"], rec["winrate"]
+        self.say(
+            channel,
+            "  ".join([
+                item("UNO High Score:", f"{hs[0]} {hs[1]} Points" if hs else none),
+                item("Fast:", f"{fast[0]} {fmt_short(fast[1])}" if fast else none),
+                item("Cards Played:", f"{cards[0]} {cards[1]}" if cards else none),
+                item("Best Streak:", f"{streak[0]} {streak[1]}" if streak else none),
+                item("Best Win%:", f"{rate[0]} {rate[1]:.1f}%" if rate else none),
+            ]),
         )
 
     # ---- running game actions ----------------------------------------------
@@ -1226,8 +1320,15 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
             result["duration"], result["plays"],
         )
         total = totals.get(result["winner"].lower())
-        if total is not None:
-            self.say(game.channel, f"{BOLD}{result['winner']}{RESET} total: {PINK}{total}{CC} Points")
+        winner = result["winner"]
+        tail = f" Total: {pk(total)} Points." if total is not None else ""
+        self.say(game.channel, bold_line(
+            f"UNO - {winner} {pk('Wins ' + str(result['points']))} Points by taking "
+            f"{pk(result['cards_taken'])} Cards.{tail}"
+        ))
+        self.say(game.channel, bold_line(
+            f"Cards played: {pk(result['cards_played'])} Cards in {pk(fmt_duration(result['duration']))}"
+        ))
 
     # ---- timers: computer moves and turn timeouts -------------------------------
     def _arm(self, game):
