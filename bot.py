@@ -428,14 +428,7 @@ class UnoGame:
         if self.state != self.PLAYING or not self.is_current(nick):
             return
         hand = self.hands[nick.lower()]
-        if re.sub(r"\s+", "", (text or "").lower()) == "wd":
-            plain, four = ("Wild", WILD), ("Wild", WD4)
-            if plain in hand and four in hand:
-                self.note(nick, "You hold both Wilds: type 'w' for Wild or 'wd4' for Wild Draw Four.")
-                return
-            card = plain if plain in hand else four
-        else:
-            card = parse_card(text)
+        card = parse_card(text)
         if card is None or card not in hand:
             if explicit:
                 self.note(nick, "❌ You don't have that card, type 'dr' to draw or play another.")
