@@ -27,6 +27,7 @@ What is stored (kept small on purpose):
 
 import json
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -74,15 +75,37 @@ def _upsert_sql(table, row):
     return sql, [row.get(c) for c in cols]
 
 
+def normalize_url(url):
+    """Accepts libsql://, turso://, wss://, https:// or a bare host name (with or without quotes)
+    and returns the https:// address the HTTP API needs."""
+    url = (url or "").strip().strip("\"'").strip()
+    if not url:
+        return ""
+    match = re.match(r"^([A-Za-z][A-Za-z0-9+.\-]*)://(.*)$", url)
+    if match:
+        scheme = "http" if match.group(1).lower() == "http" else "https"   # plain http only for local tests
+        rest = match.group(2)
+    else:
+        scheme, rest = "https", url
+    base = f"{scheme}://{rest}".rstrip("/")
+    if base.endswith("/v2/pipeline"):
+        base = base[: -len("/v2/pipeline")]
+    return base
+
+
+def normalize_token(token):
+    token = (token or "").strip().strip("\"'").strip()
+    if token.lower().startswith("bearer "):
+        token = token[7:].strip()
+    return token
+
+
 class TursoClient:
     """Tiny Turso client over HTTPS (SQL over HTTP, /v2/pipeline) - standard library only."""
 
     def __init__(self, url, token, timeout=10):
-        url = (url or "").strip()
-        if url.startswith("libsql://"):
-            url = "https://" + url[len("libsql://"):]
-        self.endpoint = url.rstrip("/") + "/v2/pipeline"
-        self.token = (token or "").strip()
+        self.endpoint = normalize_url(url) + "/v2/pipeline"
+        self.token = normalize_token(token)
         self.timeout = timeout
 
     @staticmethod
@@ -168,7 +191,7 @@ class Storage:
 
         url = turso_url if turso_url is not None else os.environ.get("TURSO_DATABASE_URL", "")
         token = turso_token if turso_token is not None else os.environ.get("TURSO_AUTH_TOKEN", "")
-        self._remote = TursoClient(url, token) if url and token else None
+        self._remote = TursoClient(url, token) if normalize_url(url) and normalize_token(token) else None
         self._seed = seed
         self._reconciled = False
         self._last_ok = 0.0
@@ -176,11 +199,13 @@ class Storage:
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._worker = None
+        # An empty database gets the old leaderboard at once (also when Turso is unreachable).
+        # When Turso is reachable it is compared row by row afterwards and the copy with
+        # more games wins, so this can never push real totals back.
+        self._seed_if_needed()
         if self._remote:
             self._worker = threading.Thread(target=self._run_worker, name="turso-sync", daemon=True)
             self._worker.start()
-        else:
-            self._seed_if_needed()
 
     # ------------------------------------------------------------------
     # Local tables
@@ -537,7 +562,6 @@ class Storage:
                     self._remote_setup()
                     self._reconcile()
                     self._reconciled = True
-                    self._seed_if_needed()
                 while self._push_pending():
                     pass
                 if time.time() - last_ping > 60:             # light health check while idle
