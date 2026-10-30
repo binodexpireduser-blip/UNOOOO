@@ -71,10 +71,18 @@ ACTIONS = ("Skip", "Reverse", "Draw Two")
 
 
 PINK = f"{CC}13"                                  # accent colour (numbers, "wins", "jo" ...)
-BOT_COLOR = f"{CC}63"                             # the computer player's name: neon pink (extended colour 63)
+def _color_code(value, default):
+    value = str(value or "").strip()
+    return value.zfill(2) if value.isdigit() and len(value) <= 2 else default
+
+
+# The computer player's name: neon pink (extended colour 63). If your IRC client does not show
+# colours above 15, set UNO_BOT_COLOR=13 on Render for the standard pink.
+BOT_COLOR = f"{CC}{_color_code(os.environ.get('UNO_BOT_COLOR'), '63')}"
+BOLD_ON = "\ue000"                                # internal marker: "make sure bold is on" (see decorate)
 WILD_BG = "15"                                    # Wild look: purple/blue/pink/green letters on light grey
 WILD_CYCLE = ["06", "02", "13", "03"]
-RAINBOW = ["04", "08", "09", "12", "06", "07"]   # red, yellow, green, blue, purple, orange (the word UNO)
+RAINBOW = ["06", "12", "04"]                      # U purple, N blue, O red (the word UNO)
 _VALUE_LABEL = {"Draw Two": "Draw2"}
 
 
@@ -94,7 +102,7 @@ def wild_block(label):
         fg = WILD_CYCLE[i % len(WILD_CYCLE)]
         pad = " " if i == 0 else ""
         parts.append(f"{CC}{fg},{WILD_BG}{pad}{ch}")
-    return "".join(parts) + " " + RESET
+    return BOLD_ON + "".join(parts) + " " + RESET
 
 
 def fmt(card):
@@ -149,8 +157,29 @@ def _uno_word(m):
     return word if bold_on else f"{BOLD}{word}{BOLD}"
 
 
+def _resolve_bold(text):
+    """Bold is a toggle in IRC. BOLD_ON means 'bold must be on here': switch it on only if it is off."""
+    if BOLD_ON not in text:
+        return text
+    out, bold = [], False
+    for ch in text:
+        if ch == BOLD_ON:
+            if not bold:
+                out.append(BOLD)
+                bold = True
+            continue
+        if ch == BOLD:
+            bold = not bold
+        elif ch == RESET:
+            bold = False
+        out.append(ch)
+    return "".join(out)
+
+
 def decorate(text):
-    """Applied to everything the bot sends: the computer player's name in neon pink, 'UNO' in bold rainbow."""
+    """Applied to everything the bot sends: Wild cards bold, the computer player's name in neon pink,
+    'UNO' in bold purple-blue-red."""
+    text = _resolve_bold(text)
     text = _BOT_NAME_RE.sub(lambda m: f"{BOT_COLOR}{m.group(0)}{CC}", text)
     text = _UNO_RE.sub(_uno_word, text)
     return text
@@ -374,7 +403,7 @@ class UnoGame:
     def announce_turn(self):
         cur = self.current()
         if cur and not self.is_bot(cur):
-            self.say(f"It is now {BOLD}{cur}'s{RESET} turn.")
+            self.say(bold_line(f"It is now {cur} 's turn."))
             self.note_hand(cur)
 
     def hand_text(self, nick, sort=False):
@@ -432,7 +461,7 @@ class UnoGame:
             return
         if len(self.players) < MIN_PLAYERS:
             self.players.append(self.bot_name)
-            self.say(f"{self.bot_name} joins UNO and is playing!")
+            self.say(f"{b(self.bot_name)} joins UNO and is playing!")
         self.start()
 
     def start(self):
@@ -819,7 +848,7 @@ class UnoGame:
     def info_turn(self):
         cur = self.current()
         if cur:
-            self.say(f"It is currently {BOLD}{cur}'s{RESET} turn.")
+            self.say(bold_line(f"It is now {cur} 's turn."))
 
     def info_counts(self):
         if self.state in (self.PLAYING, self.AWAIT_COLOR):
@@ -892,7 +921,8 @@ def _valid_channel(name):
 
 
 class DrUnoBot(irc.bot.SingleServerIRCBot):
-    def __init__(self, store, channels, nickname, realname, password, server, port=6697):
+    def __init__(self, store, channels, nickname, realname, password, server, port=6697,
+                 started_at=None, restarts=0):
         context = ssl.create_default_context()
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
@@ -911,6 +941,9 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
         self.home_channels = [c for c in channels if _valid_channel(c)]
         self.secret = os.environ.get("UNO_SECRET", "xlr8").lower()
         self.bot_player = BOT_PLAYER
+        self.started_at = started_at or time.time()   # process start, for the uptime
+        self.restarts = restarts
+        self._connected_at = 0.0
 
         self.games = {}                   # lowercase channel -> UnoGame
         self.joined = set()               # lowercase channels we are currently in
@@ -976,6 +1009,7 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
     # ---- connection events -------------------------------------------------
     def on_welcome(self, c, e):
         print("[+] Connected. Identifying and joining channels...")
+        self._connected_at = time.time()
         self._last_disconnect = 0.0
         self.joined.clear()
         if self.password:
@@ -1091,6 +1125,8 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
     # ---- private messages: the secret channel commands -----------------------
     def _handle_private(self, nick, text):
         parts = text.strip().split()
+        if parts and parts[0].lower() == "!unobotstatus":
+            return self._cmd_status(nick)
         if len(parts) < 2:
             return
         cmd, chan = parts[0].lower(), parts[1]
@@ -1131,6 +1167,8 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
         # ---- leaderboard ----
         if cmd == "!utop":
             return self._cmd_top(channel)
+        if cmd == "!utopmon":
+            return self._cmd_top_month(channel)
         if cmd == "!urank":
             return self._cmd_rank(channel, args[0] if args else nick)
         if cmd == "!ustats":
@@ -1220,12 +1258,60 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
             f"{pk('dr')} draw | {pk('pa')} pass | {pk('co r/g/b/y')} pick a color",
             f"Info: {pk('ca')} your hand | {pk('cd')} card in play | {pk('tu')} turn | {pk('od')} order | "
             f"{pk('ct')} card counts | {pk('st')} match stats",
-            f"Stats: {pk('!utop')} | {pk('!urank <nick>')} | {pk('!ustats <nick>')} | "
+            f"Stats: {pk('!utop')} | {pk('!utopmon')} this month | {pk('!urank <nick>')} | {pk('!ustats <nick>')} | "
             f"{pk('!unoallrec')} all-time records | {pk('!unomonrec')} this month",
             f"Points: Wild / Wild Draw Four {pk(100)} | Draw Two {pk(50)} | Skip / Reverse {pk(20)} | numbers face value",
         ]
         for line in lines:
             self.notice(nick, line)
+
+    @staticmethod
+    def _fmt_age(seconds):
+        seconds = int(seconds)
+        days, rest = divmod(seconds, 86400)
+        hours, rest = divmod(rest, 3600)
+        minutes, secs = divmod(rest, 60)
+        if days:
+            return f"{days}d {hours}h {minutes}m"
+        if hours:
+            return f"{hours}h {minutes}m"
+        if minutes:
+            return f"{minutes}m {secs}s"
+        return f"{secs}s"
+
+    def _cmd_status(self, nick):
+        """!unobotstatus - private message only; shows no URL, token or password."""
+        now = time.time()
+        st = self.store.status()
+        online = self.connection.is_connected()
+        irc_text = f"connected for {self._fmt_age(now - self._connected_at)}" if online and self._connected_at else (
+            "connected" if online else "offline")
+        if not st["turso_configured"]:
+            turso = f"Turso {pk('not set up')}"
+        elif st["turso_connected"]:
+            age = st["turso_last_ok_age"]
+            turso = f"Turso {pk('connected')} (checked {pk(self._fmt_age(age or 0) + ' ago')})"
+        else:
+            turso = f"Turso {pk('offline')} ({st['last_error'] or 'connecting'})"
+        self.notice(nick, f"{heading('UNO Bot Status')}")
+        self.notice(
+            nick,
+            f"Uptime: {pk(self._fmt_age(now - self.started_at))} | IRC: {pk(irc_text)} | "
+            f"Games running: {pk(len(self.games))} | Restarts: {pk(self.restarts)}",
+        )
+        self.notice(
+            nick,
+            f"Database: SQLite {pk('OK' if st['sqlite_ok'] else 'PROBLEM')} | {turso} | "
+            f"Waiting to copy to Turso: {pk(st['pending'])}",
+        )
+
+    def _cmd_top_month(self, channel):
+        rows = self.store.top_month(10)
+        label = time.strftime("%B", time.gmtime(time.time()))
+        if not rows:
+            return self.say(channel, f"No UNO games have been played in {label} yet.")
+        line = " | ".join(f"{i}. {r['display']} {PINK}{r['points']}{CC}" for i, r in enumerate(rows, 1))
+        self.say(channel, f"{BOLD}UNO Top 10 {label}{RESET} (points): {line}")
 
     def _cmd_top(self, channel):
         rows = self.store.top(10)
