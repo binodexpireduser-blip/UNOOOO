@@ -18,6 +18,7 @@ IRC_REALNAME = os.environ.get("IRC_REALNAME", "DrUNO")
 IRC_PASSWORD = os.environ.get("IRC_PASSWORD", "")   # set this on Render, never in the code
 
 # One storage object for the whole life of the process: it survives bot restarts.
+# Set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN on Render to switch on the cloud backup.
 store = Storage(hidden_nicks=[BOT_PLAYER])
 
 STATE = {"bot": None, "restarts": 0, "started": time.time()}
@@ -36,12 +37,17 @@ def health():
         games = len(bot.games) if bot else 0
     except Exception:
         connected, games = False, 0
+    db = store.status()
     return jsonify(
         status="ok",
         irc_connected=connected,
         active_games=games,
         restarts=STATE["restarts"],
         uptime_seconds=int(time.time() - STATE["started"]),
+        sqlite_ok=db["sqlite_ok"],
+        turso_configured=db["turso_configured"],
+        turso_connected=db["turso_connected"],
+        turso_pending=db["pending"],
     )
 
 
@@ -49,7 +55,8 @@ def run_irc():
     while True:
         bot = None
         try:
-            bot = DrUnoBot(store, IRC_CHANNELS, IRC_NICK, IRC_REALNAME, IRC_PASSWORD, IRC_SERVER, IRC_PORT)
+            bot = DrUnoBot(store, IRC_CHANNELS, IRC_NICK, IRC_REALNAME, IRC_PASSWORD, IRC_SERVER, IRC_PORT,
+                           started_at=STATE["started"], restarts=STATE["restarts"])
             STATE["bot"] = bot
             bot.start()
         except Exception as e:
