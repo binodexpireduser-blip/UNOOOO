@@ -12,7 +12,7 @@ queued ("outbox"); a background thread copies the queue to Turso. If Turso is un
 the queue just waits and is retried, the bot keeps playing.
 
 Turso is switched on by two environment variables (set them on Render):
-    TURSO_DATABASE_URL   turso://your-db-yourorg.turso.io   (turso:// also works)
+    TURSO_DATABASE_URL   libsql://your-db-yourorg.turso.io   (https:// also works)
     TURSO_AUTH_TOKEN     the database token
 Without them the bot runs on SQLite only.
 
@@ -79,8 +79,8 @@ class TursoClient:
 
     def __init__(self, url, token, timeout=10):
         url = (url or "").strip()
-        if url.startswith("turso://"):
-            url = "turso://" + url[len("turso://"):]
+        if url.startswith("libsql://"):
+            url = "https://" + url[len("libsql://"):]
         self.endpoint = url.rstrip("/") + "/v2/pipeline"
         self.token = (token or "").strip()
         self.timeout = timeout
