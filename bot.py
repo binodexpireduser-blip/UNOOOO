@@ -47,6 +47,7 @@ MAX_PLAYERS = 4
 HAND_SIZE = 7
 LOBBY_SECONDS = _env_int("UNO_LOBBY_SECONDS", 20)
 TURN_TIMEOUT = _env_int("UNO_TURN_TIMEOUT", 45)       # seconds a human may think
+AWAY_DELAY = _env_float("UNO_AWAY_DELAY", 3.0)        # a disconnected player's turn is auto-played after this long
 BOT_THINK_SECONDS = _env_float("UNO_BOT_THINK", 2.0)  # pause before the computer plays
 RESUME_MAX_AGE = _env_int("UNO_RESUME_MAX_AGE", 900)  # drop saved games older than this
 SEND_INTERVAL = _env_float("IRC_SEND_INTERVAL", 0.6)  # seconds per outgoing line (flood safety)
@@ -335,6 +336,7 @@ class UnoGame:
         self.hands = {}            # lowercase nick -> [cards]
         self.plays = {}            # lowercase nick -> number of cards they played
         self.strikes = {}          # lowercase nick -> consecutive timeouts
+        self.away = set()          # lowercase nicks that disconnected (their turns are auto-played)
         self.draw_pile = []
         self.discard_pile = []     # last card = the top card
         self.turn_idx = 0
@@ -538,6 +540,7 @@ class UnoGame:
         self.cards_played += 1
         self.plays[low] = self.plays.get(low, 0) + 1
         self.strikes[low] = 0
+        self.away.discard(low)
         self.has_drawn = False
         color, value = card
         self.value = value
@@ -608,6 +611,7 @@ class UnoGame:
             self.note(nick, "❌ Invalid color choice. Use r, g, b or y")
             return
         self.strikes[nick.lower()] = 0
+        self.away.discard(nick.lower())
         self._apply_color(nick, color)
 
     def _apply_color(self, nick, color):
@@ -624,6 +628,7 @@ class UnoGame:
             self.note(nick, "❌ You already drew a card! Play it with 'pl' or type 'pa' to pass.")
             return
         self.strikes[nick.lower()] = 0
+        self.away.discard(nick.lower())
         card = self._draw_one()
         if card is None:
             self.say(f"{nick} can't draw - no cards left. Turn passes.")
@@ -643,6 +648,7 @@ class UnoGame:
             self.note(nick, "❌ You must draw a card ('dr') before you can pass your turn.")
             return
         self.strikes[nick.lower()] = 0
+        self.away.discard(nick.lower())
         self.say(f"⏩ {b(nick)} passes their turn.")
         self.advance(1)
         self.announce_turn()
@@ -746,6 +752,7 @@ class UnoGame:
         hand = self.hands.pop(low, [])
         self.plays.pop(low, None)
         self.strikes.pop(low, None)
+        self.away.discard(low)
         other_humans = [p for p in self.humans() if p.lower() != low]
         bot_in = any(self.is_bot(p) for p in self.players)
         self._bump()
@@ -793,6 +800,24 @@ class UnoGame:
         if was_current:
             self.announce_turn()
 
+    def mark_away(self, nick, reason="disconnected"):
+        """A player dropped (QUIT / PART / KICK). Nothing happens at once: their turns are
+        auto-played like a timeout (draw + pass); the next miss removes them (the computer
+        player takes their cards if only one human would be left)."""
+        if self.state not in (self.PLAYING, self.AWAIT_COLOR) or not self.has_player(nick) or self.is_bot(nick):
+            return
+        if nick.lower() in self.away:
+            return
+        self.away.add(nick.lower())
+        self.say(f"⚠️ {b(nick)} {reason}. Their turn will be auto-played; if they miss it again they are removed.")
+        self._bump()
+
+    def mark_back(self, nick):
+        if nick.lower() in self.away and self.has_player(nick):
+            self.away.discard(nick.lower())
+            self.say(f"👋 {b(nick)} is back!")
+            self._bump()
+
     def timeout(self):
         """The current human ran out of time."""
         nick = self.current()
@@ -828,6 +853,9 @@ class UnoGame:
             for table in (self.hands, self.plays, self.strikes):
                 if ol in table:
                     table[nl] = table.pop(ol)
+            if ol in self.away:
+                self.away.discard(ol)
+                self.away.add(nl)
         self._bump()
 
     # ---- info commands -----------------------------------------------------
@@ -873,6 +901,7 @@ class UnoGame:
             "hands": {k: [list(c) for c in v] for k, v in self.hands.items()},
             "plays": self.plays,
             "strikes": self.strikes,
+            "away": sorted(self.away),
             "draw_pile": [list(c) for c in self.draw_pile],
             "discard_pile": [list(c) for c in self.discard_pile],
             "turn_idx": self.turn_idx,
@@ -892,6 +921,7 @@ class UnoGame:
         game.hands = {k: [tuple(c) for c in v] for k, v in d["hands"].items()}
         game.plays = dict(d.get("plays", {}))
         game.strikes = dict(d.get("strikes", {}))
+        game.away = set(d.get("away", []))
         game.draw_pile = [tuple(c) for c in d["draw_pile"]]
         game.discard_pile = [tuple(c) for c in d["discard_pile"]]
         game.turn_idx = d["turn_idx"]
@@ -1062,6 +1092,7 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
 
     def on_join(self, c, e):
         if e.source.nick.lower() != c.get_nickname().lower():
+            self._guard(self._player_back, e.target, e.source.nick)
             return
         self._guard(self._self_joined, e.target)
 
@@ -1107,7 +1138,15 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
     def _player_gone(self, channel, nick, reason):
         game = self.games.get(channel.lower())
         if game and game.has_player(nick) and not game.is_bot(nick):
-            self._run(game, game.remove, nick, reason)
+            if game.state == UnoGame.LOBBY:
+                self._run(game, game.remove, nick, reason)        # still in the lobby: just drop them
+            else:
+                self._run(game, game.mark_away, nick, reason)     # in a game: auto-play, remove on the next miss
+
+    def _player_back(self, channel, nick):
+        game = self.games.get(channel.lower())
+        if game and game.has_player(nick):
+            self._run(game, game.mark_back, nick)
 
     # ---- message events ----------------------------------------------------
     def _guard(self, fn, *args):
@@ -1428,7 +1467,8 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
         if game.is_bot(cur):
             self._later(BOT_THINK_SECONDS, self._bot_move, ch, game.serial)
         else:
-            self._later(TURN_TIMEOUT, self._turn_timeout, ch, game.serial)
+            delay = AWAY_DELAY if cur.lower() in game.away else TURN_TIMEOUT
+            self._later(delay, self._turn_timeout, ch, game.serial)
 
     def _bot_move(self, ch, serial):
         game = self.games.get(ch)
