@@ -165,7 +165,7 @@ class TursoClient:
 
 
 class Storage:
-    def __init__(self, path=None, hidden_nicks=(), turso_url=None, turso_token=None, seed=True):
+    def __init__(self, path=None, hidden_nicks=(), turso_url=None, turso_token=None, seed=True, seed_fallback=120):
         if path is None:
             data_dir = os.environ.get("DATA_DIR", "data")
             os.makedirs(data_dir, exist_ok=True)
@@ -199,13 +199,17 @@ class Storage:
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._worker = None
-        # An empty database gets the old leaderboard at once (also when Turso is unreachable).
-        # When Turso is reachable it is compared row by row afterwards and the copy with
-        # more games wins, so this can never push real totals back.
-        self._seed_if_needed()
+        # The old leaderboard is loaded into an EMPTY database only. With Turso on, that happens
+        # after Turso has answered and turned out to be empty too, so it can never touch data
+        # Turso already holds. If Turso stays unreachable for seed_fallback seconds right after
+        # a wipe, the board is filled locally so it isn't empty; Turso's rows win later anyway
+        # (the copy with more games wins).
+        self._seed_after = time.time() + seed_fallback
         if self._remote:
             self._worker = threading.Thread(target=self._run_worker, name="turso-sync", daemon=True)
             self._worker.start()
+        else:
+            self._seed_if_needed()
 
     # ------------------------------------------------------------------
     # Local tables
@@ -562,6 +566,7 @@ class Storage:
                     self._remote_setup()
                     self._reconcile()
                     self._reconciled = True
+                    self._seed_if_needed()
                 while self._push_pending():
                     pass
                 if time.time() - last_ping > 60:             # light health check while idle
@@ -573,6 +578,8 @@ class Storage:
                 self._wake.wait(timeout=30)
                 self._wake.clear()
             except Exception as ex:
+                if not self._reconciled and time.time() > self._seed_after:
+                    self._seed_if_needed()
                 self._last_error = f"{type(ex).__name__}: {ex}"[:120]
                 self._stop.wait(backoff)
                 backoff = min(backoff * 2, 120)
