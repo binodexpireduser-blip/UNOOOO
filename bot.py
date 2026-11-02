@@ -1497,7 +1497,7 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
             ))
         elif streak >= 2:
             self.say(game.channel, bold_line(f"{winner} is on a {pk(streak)} win streak 🔥"))
-        tail = f" Total: {pk(total)} Points." if total is not None else ""
+        tail = f" Total: {pk(result['points'] + bonus)} Points."      # this match only: card points + streak bonus
         self.say(game.channel, bold_line(
             f"UNO - {winner} {pk('Wins ' + str(result['points']))} Points by taking "
             f"{pk(result['cards_taken'])} Cards.{tail}"
