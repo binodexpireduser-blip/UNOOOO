@@ -61,6 +61,18 @@ DDL = [
 ]
 
 
+STREAK_BONUS = {3: 500, 6: 1000, 9: 1700, 12: 2500}   # win streak -> bonus points
+BONUS_AFTER_12 = 200                                   # every further win in a streak past 12
+MAX_DEFER = 120    # seconds a finished game may wait for a quiet moment before it is copied anyway
+
+
+def streak_bonus(streak):
+    """Bonus points for reaching this win streak with the win that was just recorded."""
+    if streak > 12:
+        return BONUS_AFTER_12
+    return STREAK_BONUS.get(streak, 0)
+
+
 def _upsert_sql(table, row):
     """Write one absolute row. The WHERE keeps a row from ever being replaced by one with
     fewer games, so an empty or stale copy can never overwrite good totals."""
@@ -193,12 +205,17 @@ class Storage:
         token = turso_token if turso_token is not None else os.environ.get("TURSO_AUTH_TOKEN", "")
         self._remote = TursoClient(url, token) if normalize_url(url) and normalize_token(token) else None
         self._seed = seed
+        self._busy = False                 # True while a game is being played
+        self.max_defer = MAX_DEFER
+        self._pending_since = None         # when the oldest not-yet-copied row was queued
         self._reconciled = False
         self._last_ok = 0.0
         self._last_error = None
         self._stop = threading.Event()
         self._wake = threading.Event()
         self._worker = None
+        if self._db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0]:
+            self._pending_since = time.time()
         # The old leaderboard is loaded into an EMPTY database only. With Turso on, that happens
         # after Turso has answered and turned out to be empty too, so it can never touch data
         # Turso already holds. If Turso stays unreachable for seed_fallback seconds right after
@@ -272,6 +289,8 @@ class Storage:
         """Remember the newest version of a row to copy to Turso (one entry per row)."""
         if not self._remote:
             return
+        if self._pending_since is None:
+            self._pending_since = time.time()
         seq = int(self._meta_get("seq") or 0) + 1
         self._meta_set("seq", seq)
         self._db.execute(
@@ -279,6 +298,20 @@ class Storage:
             (kind, key, json.dumps(payload, separators=(",", ":")), seq),
         )
         self._wake.set()
+
+    def set_busy(self, busy):
+        """The bot calls this with True while any game is being played. The copy to Turso then
+        waits for a quiet moment (a finished game is copied right after, during the cool-down)."""
+        busy = bool(busy)
+        if busy != self._busy:
+            self._busy = busy
+            if not busy:
+                self._wake.set()
+
+    def _may_push(self):
+        if not self._busy:
+            return True
+        return self._pending_since is not None and time.time() - self._pending_since > self.max_defer
 
     def _enqueue_row(self, table, row):
         key = row["nick_lc"] if table == "players" else f"{row['month']}|{row['nick_lc']}"
@@ -323,12 +356,13 @@ class Storage:
             [row.get(c) for c in cols],
         )
 
-    def record_game(self, participants, winner, points, duration, plays=None):
+    def record_game(self, participants, winner, points, duration, plays=None, info=None):
         """Store the result of a finished game (all-time AND current month).
 
         participants: nicks that were still in the game at the end (the winner included).
         Anyone who left mid-game is simply not in this list, so the game is erased for them.
-        Returns {nick_lowercase: new_all_time_total_points}.
+        Returns {nick_lowercase: new_all_time_total_points} (streak bonus included).
+        info (optional dict) is filled with the winner's {"streak": n, "bonus": b}.
         """
         plays = plays or {}
         now = time.time()
@@ -344,6 +378,12 @@ class Storage:
 
                 row = self._db.execute("SELECT * FROM players WHERE nick_lc = ?", (key,)).fetchone()
                 new = self._next_stats(row, nick, won, points, duration, played)
+                bonus = 0
+                if won and key not in self.hidden:
+                    bonus = streak_bonus(new["streak"])
+                    new["points"] += bonus            # best_game_points stays the points of the cards
+                if won and info is not None:
+                    info.update(streak=new["streak"] if key not in self.hidden else 0, bonus=bonus)
                 new.update(nick_lc=key, display=nick, last_played=now)
                 self._write_row("players", new)
                 self._enqueue_row("players", new)
@@ -353,6 +393,7 @@ class Storage:
                     "SELECT * FROM monthly WHERE month = ? AND nick_lc = ?", (month, key)
                 ).fetchone()
                 mnew = self._next_stats(mrow, nick, won, points, duration, played)
+                mnew["points"] += bonus
                 mnew.update(month=month, nick_lc=key, display=nick, last_played=now)
                 self._write_row("monthly", mnew)
                 self._enqueue_row("monthly", mnew)
@@ -567,15 +608,16 @@ class Storage:
                     self._reconcile()
                     self._reconciled = True
                     self._seed_if_needed()
-                while self._push_pending():
-                    pass
+                if self._may_push():
+                    while self._push_pending():
+                        pass
                 if time.time() - last_ping > 60:             # light health check while idle
                     self._remote.run([("SELECT 1", [])])
                     last_ping = time.time()
                 self._last_ok = time.time()
                 self._last_error = None
                 backoff = 5
-                self._wake.wait(timeout=30)
+                self._wake.wait(timeout=5 if self._pending_since is not None else 30)
                 self._wake.clear()
             except Exception as ex:
                 if not self._reconciled and time.time() > self._seed_after:
@@ -616,6 +658,8 @@ class Storage:
                     "DELETE FROM outbox WHERE kind = ? AND key = ? AND seq = ?",
                     (r["kind"], r["key"], r["seq"]),
                 )
+            if self._db.execute("SELECT COUNT(*) FROM outbox").fetchone()[0] == 0:
+                self._pending_since = None
         return True
 
     def _reconcile(self):
