@@ -46,6 +46,7 @@ MIN_PLAYERS = 2
 MAX_PLAYERS = 4
 HAND_SIZE = 7
 LOBBY_SECONDS = _env_int("UNO_LOBBY_SECONDS", 20)
+COOLDOWN_SECONDS = _env_int("UNO_COOLDOWN", 15)       # pause after a game (the result is copied to Turso meanwhile)
 TURN_TIMEOUT = _env_int("UNO_TURN_TIMEOUT", 45)       # seconds a human may think
 AWAY_DELAY = _env_float("UNO_AWAY_DELAY", 3.0)        # a disconnected player's turn is auto-played after this long
 BOT_THINK_SECONDS = _env_float("UNO_BOT_THINK", 2.0)  # pause before the computer plays
@@ -300,6 +301,25 @@ def pk(value):
     return f"{PINK}{value}{CC}"
 
 
+def cooldown_word():
+    """CoolDownTime in bold: C purple, D blue, T red (the colours of U, N, O)."""
+    return f"{BOLD}{CC}06C{CC}ool{CC}12D{CC}own{CC}04T{CC}ime{BOLD}"
+
+
+def lets_play():
+    """Let's Play in bold: L blue, P red."""
+    return f"{BOLD}{CC}12L{CC}et's {CC}04P{CC}lay{BOLD}"
+
+
+def is_legal(card, hand, color, value):
+    """Playable on the pile AND allowed: Wild Draw Four only when the hand has no card of the pile's colour."""
+    if not is_playable(card, color, value):
+        return False
+    if card == ("Wild", WD4) and any(c[0] == color for c in hand):
+        return False
+    return True
+
+
 def heading(text):
     """Bold pink heading (used by the records)."""
     return f"{BOLD}{PINK}{text}{CC}{BOLD}"
@@ -522,13 +542,18 @@ class UnoGame:
             return
         hand = self.hands[nick.lower()]
         card = parse_card(text)
-        if card is None or card not in hand:
+        if card is None:
             if explicit:
-                self.note(nick, "❌ You don't have that card, type 'dr' to draw or play another.")
+                self.note(nick, "❌ Unknown card. Examples: r5, bs, gd, w, wd4")
+            return
+        if card not in hand:
+            self.note(nick, f"You don't have {fmt(card)} in your hand - draw or play another card")
             return
         if not is_playable(card, self.color, self.value):
-            if explicit:
-                self.note(nick, "❌ Invalid play! Must match current pile color or value.")
+            self.note(nick, "❌ Invalid play! Must match current pile color or value.")
+            return
+        if not is_legal(card, hand, self.color, self.value):
+            self.note(nick, f"You have a valid color card - play that first before using {fmt(card)}")
             return
         self._do_play(nick, card)
 
@@ -662,7 +687,7 @@ class UnoGame:
         if nick is None or not self.is_bot(nick):
             return
         hand = self.hands[nick.lower()]
-        playable = [c for c in hand if is_playable(c, self.color, self.value)]
+        playable = [c for c in hand if is_legal(c, hand, self.color, self.value)]
         if not playable:
             card = self._draw_one()
             if card is None:
@@ -672,7 +697,7 @@ class UnoGame:
                 return
             hand.append(card)
             self.say(f"{nick} drew a card")
-            if is_playable(card, self.color, self.value):
+            if is_legal(card, hand, self.color, self.value):
                 playable = [card]
             else:
                 self.say(f"⏩ {nick} passes their turn.")
@@ -975,6 +1000,7 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
         self.restarts = restarts
         self._connected_at = 0.0
 
+        self.cooling = {}                 # lowercase channel -> time the cool-down ends
         self.games = {}                   # lowercase channel -> UnoGame
         self.joined = set()               # lowercase channels we are currently in
         self._last_join_try = {}
@@ -986,6 +1012,7 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
         self._last_tick = time.time()
 
         self._restore_games()
+        self._update_busy()
 
         sched = self.reactor.scheduler
         sched.execute_every(0.3, self._safe_cb(self._drain))
@@ -1183,6 +1210,7 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
                 self.say(nick, f"{chan} is a home channel, I won't leave it.")
                 return
             self.store.remove_channel(chan)
+            self.cooling.pop(chan.lower(), None)
             self.games.pop(chan.lower(), None)
             self.store.delete_game(chan)
             self.joined.discard(chan.lower())
@@ -1272,6 +1300,9 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
         ch = channel.lower()
         if ch in self.games:
             return
+        left = self.cooling.get(ch, 0) - time.time()
+        if left > 0:
+            return self.notice(nick, f"UNO {cooldown_word()}: a new game opens in {pk(str(int(left) + 1) + 's')}.")
         game = UnoGame(channel, self.bot_player)
         game.players.append(nick)
         self.games[ch] = game
@@ -1287,6 +1318,10 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
             return
         if ch not in self.joined:
             return self._later(5, self._lobby_timeout, ch, game)
+        if not game.humans():
+            del self.games[ch]
+            self.say(game.channel, "UNO Stopped as no player joined. To start it again please type !uno")
+            return
         self._run(game, game.finish_lobby)
 
     def _cmd_faq(self, nick):
@@ -1300,6 +1335,8 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
             f"Stats: {pk('!utop')} | {pk('!utopmon')} this month | {pk('!urank <nick>')} | {pk('!ustats <nick>')} | "
             f"{pk('!unoallrec')} all-time records | {pk('!unomonrec')} this month",
             f"Points: Wild / Wild Draw Four {pk(100)} | Draw Two {pk(50)} | Skip / Reverse {pk(20)} | numbers face value",
+            f"Win streak bonus: 3 wins {pk(500)} | 6 wins {pk(1000)} | 9 wins {pk(1700)} | 12 wins {pk(2500)} | every win after 12 {pk(200)}",
+            f"Wild Draw Four can only be played when you have no card of the current color.",
         ]
         for line in lines:
             self.notice(nick, line)
@@ -1421,6 +1458,11 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
             if nick.lower() != self.bot_player.lower():
                 self.notice(nick, text)
 
+    def _update_busy(self):
+        """Tell the storage whether a game is being played: copying to Turso waits for a quiet moment."""
+        busy = any(g.state in (UnoGame.PLAYING, UnoGame.AWAIT_COLOR) for g in self.games.values())
+        self.store.set_busy(busy)
+
     def _run(self, game, fn, *args):
         before = game.version
         fn(*args)
@@ -1432,6 +1474,7 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
             if game.state != UnoGame.LOBBY:
                 self.store.save_game(game.channel, game.to_dict())
             self._arm(game)
+        self._update_busy()
 
     def _finish(self, game, result):
         ch = game.channel.lower()
@@ -1439,13 +1482,21 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
             del self.games[ch]
         self.store.delete_game(game.channel)
         if result.get("cancelled"):
-            return
+            return self._update_busy()
+        info = {}
         totals = self.store.record_game(
             result["participants"], result["winner"], result["points"],
-            result["duration"], result["plays"],
+            result["duration"], result["plays"], info=info,
         )
         total = totals.get(result["winner"].lower())
         winner = result["winner"]
+        streak, bonus = info.get("streak", 0), info.get("bonus", 0)
+        if bonus:
+            self.say(game.channel, bold_line(
+                f"{winner} is on a {pk(streak)} win streak and earns {CC}04{bonus}{CC} bonus Points"
+            ))
+        elif streak >= 2:
+            self.say(game.channel, bold_line(f"{winner} is on a {pk(streak)} win streak 🔥"))
         tail = f" Total: {pk(total)} Points." if total is not None else ""
         self.say(game.channel, bold_line(
             f"UNO - {winner} {pk('Wins ' + str(result['points']))} Points by taking "
@@ -1454,6 +1505,33 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
         self.say(game.channel, bold_line(
             f"Cards played: {pk(result['cards_played'])} Cards in {pk(fmt_duration(result['duration']))}"
         ))
+        self._update_busy()
+        self._start_cooldown(game.channel)
+
+    # ---- cool-down between games, then a new lobby opens by itself ----------------
+    def _start_cooldown(self, channel):
+        ch = channel.lower()
+        self.cooling[ch] = time.time() + COOLDOWN_SECONDS
+        self.say(channel, f"UNO {cooldown_word()} {pk(str(COOLDOWN_SECONDS) + 's')}")
+        self._later(COOLDOWN_SECONDS, self._cooldown_over, ch, channel)
+
+    def _cooldown_over(self, ch, channel):
+        if ch not in self.cooling:
+            return
+        if ch not in [c.lower() for c in self._desired_channels()]:
+            self.cooling.pop(ch, None)                 # the bot was told to leave this channel
+            return
+        if ch not in self.joined:
+            return self._later(5, self._cooldown_over, ch, channel)
+        del self.cooling[ch]
+        if ch in self.games:
+            return
+        self.say(channel, f"UNO {cooldown_word()} over")
+        self.say(channel, f"UNO {lets_play()}")
+        self.say(channel, f"UNO You have {pk(str(LOBBY_SECONDS) + 's')} to join. Type {pk('jo')}.")
+        game = UnoGame(channel, self.bot_player)
+        self.games[ch] = game
+        self._later(LOBBY_SECONDS, self._lobby_timeout, ch, game)
 
     # ---- timers: computer moves and turn timeouts -------------------------------
     def _arm(self, game):
