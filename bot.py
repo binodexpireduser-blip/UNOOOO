@@ -992,6 +992,7 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
         )
 
         self.store = store
+        self.desired_nick = nickname
         self.password = password or ""
         self.home_channels = [c for c in channels if _valid_channel(c)]
         self.secret = os.environ.get("UNO_SECRET", "xlr8").lower()
@@ -1069,9 +1070,31 @@ class DrUnoBot(irc.bot.SingleServerIRCBot):
         self._connected_at = time.time()
         self._last_disconnect = 0.0
         self.joined.clear()
-        if self.password:
-            c.privmsg("NickServ", f"IDENTIFY {self.password}")
+        if self.password and c.get_nickname().lower() != self.desired_nick.lower():
+            # The wanted nick was busy (an old connection still hanging): free it, take it back, then log in.
+            c.privmsg("NickServ", f"GHOST {self.desired_nick} {self.password}")
+            self._later(3, self._regain_nick)
+        self._login()
         self._later(2, self._join_all)
+
+    def _login(self):
+        """Log the bot's nick in with NickServ (the password comes from IRC_PASSWORD)."""
+        if self.password and self.connection.is_connected():
+            self.connection.privmsg("NickServ", f"IDENTIFY {self.password}")
+
+    def _regain_nick(self):
+        c = self.connection
+        if c.is_connected() and c.get_nickname().lower() != self.desired_nick.lower():
+            c.nick(self.desired_nick)
+            self._later(2, self._login)
+
+    def on_privnotice(self, c, e):
+        """NickServ's answers go to the Render log (never the password)."""
+        try:
+            if str(e.source.nick).lower() == "nickserv":
+                print(f"[NickServ] {e.arguments[0][:160]}")
+        except Exception:
+            pass
 
     def on_disconnect(self, c, e):
         # The irc library reconnects by itself (exponential back-off). The watchdog
