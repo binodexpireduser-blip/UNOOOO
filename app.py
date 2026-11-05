@@ -13,9 +13,11 @@ app = Flask(__name__)
 IRC_SERVER = os.environ.get("IRC_SERVER", "irc.hybridirc.com")
 IRC_PORT = int(os.environ.get("IRC_PORT", "6697"))
 IRC_CHANNELS = [c.strip() for c in os.environ.get("IRC_CHANNELS", "#global").split(",") if c.strip()]
-IRC_NICK = os.environ.get("IRC_NICK", "DrUNO")
-IRC_REALNAME = os.environ.get("IRC_REALNAME", "DrUNO")
-IRC_PASSWORD = os.environ.get("IRC_PASSWORD", "")   # set this on Render, never in the code
+# The bot's login is written here on purpose, so nothing has to be set on Render for it
+# (an old IRC_NICK / IRC_REALNAME / IRC_PASSWORD value on Render can no longer change it).
+IRC_NICK = "DrUno"
+IRC_REALNAME = "DrUno"
+IRC_PASSWORD = "heyhey123"      # NickServ password of the nick above
 
 # One storage object for the whole life of the process: it survives bot restarts.
 # Set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN on Render to switch on the cloud backup.
